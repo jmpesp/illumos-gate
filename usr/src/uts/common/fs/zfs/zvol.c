@@ -291,29 +291,63 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	if (BP_IS_GANG(bp))
 		return (SET_ERROR(EFRAGS));
 
-	/*
-	 * See if the block is at the end of the previous extent.
-	 */
-	ze = avl_last(&ma->ma_zv->zv_extents);
-	if (ze &&
-	    DVA_GET_VDEV(BP_IDENTITY(bp)) == DVA_GET_VDEV(&ze->ze_dva) &&
-	    DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
-	    DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
-		ze->ze_nblks++;
-		return (0);
-	}
+  /*
+   * See if we can extend an existing extent
+   */
+  zvol_extent_t * found = (zvol_extent_t *)NULL;
+
+  for (
+      ze = avl_first(&ma->ma_zv->zv_extents);
+      ze != NULL;
+      ze = avl_walk(&ma->ma_zv->zv_extents, ze, AVL_AFTER)) {
+    if (found) {
+      // don't extend another, just bump each offset by block size as we walk
+      // the rest
+      ze->ze_offset += bs;
+    } else if (DVA_GET_VDEV(BP_IDENTITY(bp)) == DVA_GET_VDEV(&ze->ze_dva) &&
+        DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
+        DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
+      ze->ze_nblks++;
+      found = ze;
+    }
+  }
+
+  if (found) {
+    // Coalesce found with its neighbour if they are contiguous after the
+    // extension.
+    zvol_extent_t * next =
+      avl_walk(&ma->ma_zv->zv_extents, found, AVL_AFTER);
+
+    if (next) {
+      if ((found->ze_offset + found->ze_nblks * bs) == next->ze_offset) {
+        if (DVA_GET_VDEV(&found->ze_dva) == DVA_GET_VDEV(&next->ze_dva)) {
+          if ((DVA_GET_OFFSET(&found->ze_dva) + found->ze_nblks * bs) == DVA_GET_OFFSET(&next->ze_dva)) {
+            // Bye bye neighbour
+            found->ze_nblks += next->ze_nblks;
+            avl_remove(&ma->ma_zv->zv_extents, next);
+          }
+        }
+      }
+    }
+    return (0);
+  }
 
 	dprintf_bp(bp, "%s", "next blkptr:");
 
-	/* start a new extent */
+	/* start a new extent off the end */
+	ze = avl_last(&ma->ma_zv->zv_extents);
+
 	zvol_extent_t *nze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
 	nze->ze_dva = bp->blk_dva[0];	/* structure assignment */
 	nze->ze_nblks = 1;
+
   if (ze) {
+    // this new extent's offset is off the end of the last one
     nze->ze_offset = ze->ze_offset + ze->ze_nblks * bs;
   } else {
     nze->ze_offset = 0;
   }
+
 	avl_add(&ma->ma_zv->zv_extents, nze);
 	return (0);
 }
