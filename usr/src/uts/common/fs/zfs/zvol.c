@@ -111,7 +111,7 @@ typedef struct zvol_extent {
 	avl_node_t ze_node;	/* avl node link */
 	dva_t		ze_dva;		/* dva associated with this extent */
 	uint64_t	ze_nblks;	/* number of blocks in extent */
-  uint64_t ze_offset;
+	uint64_t ze_offset;
 } zvol_extent_t;
 
 /*
@@ -291,46 +291,58 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	if (BP_IS_GANG(bp))
 		return (SET_ERROR(EFRAGS));
 
-  /*
-   * See if we can extend an existing extent
-   */
-  zvol_extent_t * found = (zvol_extent_t *)NULL;
+	/*
+	 * See if we can extend an existing extent
+	 */
+	zvol_extent_t *found = (zvol_extent_t *)NULL;
 
-  for (
-      ze = avl_first(&ma->ma_zv->zv_extents);
-      ze != NULL;
-      ze = avl_walk(&ma->ma_zv->zv_extents, ze, AVL_AFTER)) {
-    if (found) {
-      // don't extend another, just bump each offset by block size as we walk
-      // the rest
-      ze->ze_offset += bs;
-    } else if (DVA_GET_VDEV(BP_IDENTITY(bp)) == DVA_GET_VDEV(&ze->ze_dva) &&
-        DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
-        DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
-      ze->ze_nblks++;
-      found = ze;
-    }
-  }
+	for (
+	    ze = avl_first(&ma->ma_zv->zv_extents);
+	    ze != NULL;
+	    ze = avl_walk(&ma->ma_zv->zv_extents, ze, AVL_AFTER)) {
+		if (found) {
+			/*
+			 * If an extent was already extended, don't extend another,
+			 * just bump each offset by block size as we walk the rest.
+			 */
+			ze->ze_offset += bs;
+		} else if (DVA_GET_VDEV(BP_IDENTITY(bp)) ==
+		    DVA_GET_VDEV(&ze->ze_dva) &&
+		    DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
+		    DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
+			ze->ze_nblks++;
+			found = ze;
+		}
+	}
 
-  if (found) {
-    // Coalesce found with its neighbour if they are contiguous after the
-    // extension.
-    zvol_extent_t * next =
-      avl_walk(&ma->ma_zv->zv_extents, found, AVL_AFTER);
+	if (found) {
+		/*
+		 * Coalesce found with its neighbour if they are contiguous
+		 * after the extension.
+		 */
+		zvol_extent_t *next =
+		    avl_walk(&ma->ma_zv->zv_extents, found, AVL_AFTER);
 
-    if (next) {
-      if ((found->ze_offset + found->ze_nblks * bs) == next->ze_offset) {
-        if (DVA_GET_VDEV(&found->ze_dva) == DVA_GET_VDEV(&next->ze_dva)) {
-          if ((DVA_GET_OFFSET(&found->ze_dva) + found->ze_nblks * bs) == DVA_GET_OFFSET(&next->ze_dva)) {
-            // Bye bye neighbour
-            found->ze_nblks += next->ze_nblks;
-            avl_remove(&ma->ma_zv->zv_extents, next);
-          }
-        }
-      }
-    }
-    return (0);
-  }
+		if (next) {
+			boolean_t contiguous_offset =
+			    (found->ze_offset + found->ze_nblks * bs) ==
+			    next->ze_offset;
+
+			boolean_t same_vdev = DVA_GET_VDEV(&found->ze_dva) ==
+			    DVA_GET_VDEV(&next->ze_dva);
+
+			boolean_t contiguous_dva_offset =
+			    (DVA_GET_OFFSET(&found->ze_dva) + found->ze_nblks * bs)
+			    == DVA_GET_OFFSET(&next->ze_dva);
+
+			if (contiguous_offset && save_vdev &&
+			    contiguous_dva_offset) {
+				found->ze_nblks += next->ze_nblks;
+				avl_remove(&ma->ma_zv->zv_extents, next);
+			}
+		}
+		return (0);
+	}
 
 	dprintf_bp(bp, "%s", "next blkptr:");
 
@@ -341,12 +353,12 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	nze->ze_dva = bp->blk_dva[0];	/* structure assignment */
 	nze->ze_nblks = 1;
 
-  if (ze) {
-    // this new extent's offset is off the end of the last one
-    nze->ze_offset = ze->ze_offset + ze->ze_nblks * bs;
-  } else {
-    nze->ze_offset = 0;
-  }
+	if (ze) {
+		// this new extent's offset is off the end of the last one
+		nze->ze_offset = ze->ze_offset + ze->ze_nblks * bs;
+	} else {
+		nze->ze_offset = 0;
+	}
 
 	avl_add(&ma->ma_zv->zv_extents, nze);
 	return (0);
@@ -608,7 +620,7 @@ zvol_create_minor(const char *name)
 		zv->zv_flags |= ZVOL_RDONLY;
 	rangelock_init(&zv->zv_rangelock, NULL, NULL);
 	avl_create(&zv->zv_extents, zvol_extent_compare,
-    sizeof (zvol_extent_t), offsetof(zvol_extent_t, ze_node));
+	    sizeof (zvol_extent_t), offsetof(zvol_extent_t, ze_node));
 	/* get and cache the blocksize */
 	error = dmu_object_info(os, ZVOL_OBJ, &doi);
 	ASSERT(error == 0);
@@ -1199,20 +1211,20 @@ zvol_dumpio(zvol_state_t *zv, void *addr, uint64_t offset, uint64_t size,
 	VERIFY3U(size, <=, zv->zv_volblocksize);
 
 	/* Locate the extent this belongs to */
-  avl_index_t where = (uintptr_t)NULL;
+	avl_index_t where = (uintptr_t)NULL;
 
-  zvol_extent_t search;
-  search.ze_offset = offset;
+	zvol_extent_t search;
+	search.ze_offset = offset;
 
-  ze = avl_find(&zv->zv_extents, &search, &where);
+	ze = avl_find(&zv->zv_extents, &search, &where);
 
-  if (ze == NULL)
-    ze = avl_nearest(&zv->zv_extents, where, AVL_BEFORE);
+	if (ze == NULL)
+		ze = avl_nearest(&zv->zv_extents, where, AVL_BEFORE);
 
 	if (ze == NULL)
 		return (SET_ERROR(EINVAL));
 
-  // Validate the found extent contains this offset.
+	// Validate the found extent contains this offset.
 	VERIFY3U(ze->ze_offset, <=, offset);
 	VERIFY3U((offset - ze->ze_offset), <=, (ze->ze_nblks * zv->zv_volblocksize));
 
