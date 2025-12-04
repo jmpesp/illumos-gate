@@ -90,6 +90,7 @@
 #include <sys/smt.h>
 #include <sys/dkioc_free_util.h>
 #include <sys/zfs_rlock.h>
+#include <util/qsort.h>
 
 #include "zfs_namecheck.h"
 
@@ -263,11 +264,21 @@ zvol_minor_lookup(const char *name)
 	return (NULL);
 }
 
-/* extent mapping arg */
 struct maparg {
-	zvol_state_t	*ma_zv;
+	avl_tree_t	ma_dva_vdevs;
 	uint64_t	ma_blks;
 };
+
+typedef struct blkptr_stash {
+	list_node_t	node;
+	blkptr_t	bp;
+} blkptr_stash_t;
+
+typedef struct dva_vdevs {
+	avl_node_t	node;		/* avl node link */
+	uint64_t	dva;		/* dva */
+	list_t		blkptrs;	/* all blkptrs with this dva */
+} dva_vdevs_t;
 
 /*ARGSUSED*/
 static int
@@ -275,8 +286,6 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
     const zbookmark_phys_t *zb, const dnode_phys_t *dnp, void *arg)
 {
 	struct maparg *ma = arg;
-	zvol_extent_t *ze;
-	int bs = ma->ma_zv->zv_volblocksize;
 
 	if (bp == NULL || BP_IS_HOLE(bp) ||
 	    zb->zb_object != ZVOL_OBJ || zb->zb_level != 0)
@@ -291,76 +300,33 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 	if (BP_IS_GANG(bp))
 		return (SET_ERROR(EFRAGS));
 
-	/*
-	 * See if we can extend an existing extent
-	 */
-	zvol_extent_t *found = (zvol_extent_t *)NULL;
+	// Bucket by DVA_GET_VDEV equivalence, stash blkptr_t in list
 
-	for (
-	    ze = avl_first(&ma->ma_zv->zv_extents);
-	    ze != NULL;
-	    ze = avl_walk(&ma->ma_zv->zv_extents, ze, AVL_AFTER)) {
-		if (found) {
-			/*
-			 * If an extent was already extended, don't extend another,
-			 * just bump each offset by block size as we walk the rest.
-			 */
-			ze->ze_offset += bs;
-		} else if (DVA_GET_VDEV(BP_IDENTITY(bp)) ==
-		    DVA_GET_VDEV(&ze->ze_dva) &&
-		    DVA_GET_OFFSET(BP_IDENTITY(bp)) ==
-		    DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
-			ze->ze_nblks++;
-			found = ze;
-		}
-	}
+	blkptr_stash_t* bps = kmem_zalloc(sizeof (blkptr_stash_t), KM_SLEEP);
+	bps->bp = *bp;
+
+	// search for an existing bucket to add to
+	dva_vdevs_t search;
+	search.dva = DVA_GET_VDEV(BP_IDENTITY(bp));
+
+	dva_vdevs_t* found = avl_find(&ma->ma_dva_vdevs, &search, NULL);
 
 	if (found) {
-		/*
-		 * Coalesce found with its neighbour if they are contiguous
-		 * after the extension.
-		 */
-		zvol_extent_t *next =
-		    avl_walk(&ma->ma_zv->zv_extents, found, AVL_AFTER);
-
-		if (next) {
-			boolean_t contiguous_offset =
-			    (found->ze_offset + found->ze_nblks * bs) ==
-			    next->ze_offset;
-
-			boolean_t same_vdev = DVA_GET_VDEV(&found->ze_dva) ==
-			    DVA_GET_VDEV(&next->ze_dva);
-
-			boolean_t contiguous_dva_offset =
-			    (DVA_GET_OFFSET(&found->ze_dva) + found->ze_nblks * bs)
-			    == DVA_GET_OFFSET(&next->ze_dva);
-
-			if (contiguous_offset && same_vdev &&
-			    contiguous_dva_offset) {
-				found->ze_nblks += next->ze_nblks;
-				avl_remove(&ma->ma_zv->zv_extents, next);
-			}
-		}
-		return (0);
-	}
-
-	dprintf_bp(bp, "%s", "next blkptr:");
-
-	/* start a new extent off the end */
-	ze = avl_last(&ma->ma_zv->zv_extents);
-
-	zvol_extent_t *nze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
-	nze->ze_dva = bp->blk_dva[0];	/* structure assignment */
-	nze->ze_nblks = 1;
-
-	if (ze) {
-		// this new extent's offset is off the end of the last one
-		nze->ze_offset = ze->ze_offset + ze->ze_nblks * bs;
+		// add to an existing bucket
+		list_insert_tail(&found->blkptrs, bps);
 	} else {
-		nze->ze_offset = 0;
+		// create a new bucket and add to it
+		dva_vdevs_t* dvs = kmem_zalloc(sizeof (dva_vdevs_t), KM_SLEEP);
+		dvs->dva = DVA_GET_VDEV(BP_IDENTITY(bp));
+
+		list_create(&dvs->blkptrs, sizeof (blkptr_stash_t),
+		    offsetof(blkptr_stash_t, node));
+
+		list_insert_tail(&dvs->blkptrs, bps);
+
+		avl_add(&ma->ma_dva_vdevs, dvs);
 	}
 
-	avl_add(&ma->ma_zv->zv_extents, nze);
 	return (0);
 }
 
@@ -376,23 +342,132 @@ zvol_free_extents(zvol_state_t *zv)
 }
 
 static int
+blkptr_cmp_offset(blkptr_t *p, blkptr_t *q) {
+	uint64_t po = DVA_GET_OFFSET(BP_IDENTITY(p));
+	uint64_t qo = DVA_GET_OFFSET(BP_IDENTITY(q));
+
+	return (TREE_CMP(po, qo));
+}
+
+static int
+dva_vdevs_compare(const void *arg1, const void *arg2)
+{
+	const dva_vdevs_t *e1 = (const dva_vdevs_t *)arg1;
+	const dva_vdevs_t *e2 = (const dva_vdevs_t *)arg2;
+
+	return (TREE_CMP(e1->dva, e2->dva));
+}
+
+static int
 zvol_get_lbas(zvol_state_t *zv)
 {
 	objset_t *os = zv->zv_objset;
 	struct maparg	ma;
 	int		err;
 
-	ma.ma_zv = zv;
+	avl_create(&ma.ma_dva_vdevs, dva_vdevs_compare,
+	    sizeof (dva_vdevs_t), offsetof(dva_vdevs_t, node));
 	ma.ma_blks = 0;
+
 	zvol_free_extents(zv);
 
 	/* commit any in-flight changes before traversing the dataset */
 	txg_wait_synced(dmu_objset_pool(os), 0);
+
 	err = traverse_dataset(dmu_objset_ds(os), 0,
 	    TRAVERSE_PRE | TRAVERSE_PREFETCH_METADATA, zvol_map_block, &ma);
+
 	if (err || ma.ma_blks != (zv->zv_volsize / zv->zv_volblocksize)) {
 		zvol_free_extents(zv);
 		return (err ? err : EIO);
+	}
+
+	// second pass: eat from first pass, then qsort by DVA_GET_OFFSET
+	{
+		dva_vdevs_t* bucket = NULL;
+		zvol_extent_t *ze = NULL;
+		uint64_t ze_offset = 0;
+		int bs = zv->zv_volblocksize;
+
+		for (bucket = avl_first(&ma.ma_dva_vdevs);
+		    bucket != NULL;
+		    bucket = avl_walk(&ma.ma_dva_vdevs, bucket, AVL_AFTER)) {
+
+			// for each DVA_GET_VDEV bucket, grab all the stashed blkptrs
+			size_t list_size = 0;
+			blkptr_stash_t* head = list_head(&bucket->blkptrs);
+
+			while (head) {
+				head = list_next(&bucket->blkptrs, head);
+				list_size += 1;
+			}
+
+			blkptr_t* all = kmem_zalloc(
+			    list_size * sizeof (blkptr_t), KM_SLEEP
+			);
+
+			size_t i = 0;
+
+			while (head = list_head(&bucket->blkptrs)) {
+				list_remove(&bucket->blkptrs, head);
+
+				all[i] = head->bp;
+				i += 1;
+
+				kmem_free(head, sizeof (blkptr_stash_t));
+			}
+
+			// sort them!
+			(void) qsort(all, list_size, sizeof (blkptr_t),
+			    (int (*)(const void *, const void *))blkptr_cmp_offset);
+
+			// eat from this list, and make the zvol_extent_t tree
+			for (i = 0; i < list_size; i++) {
+				blkptr_t bp = all[i];
+
+				if (ze) {
+					// can we extend an existing extent?
+					if (DVA_GET_OFFSET(BP_IDENTITY(&bp)) ==
+					    DVA_GET_OFFSET(&ze->ze_dva) + ze->ze_nblks * bs) {
+						ze->ze_nblks++;
+					} else {
+						// if not, new extent required
+						avl_add(&zv->zv_extents, ze);
+
+						ze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
+						ze->ze_dva = bp.blk_dva[0]; /* structure assignment */
+						ze->ze_nblks = 1;
+						ze->ze_offset = ze_offset;
+					}
+				} else {
+					// nothing exists yet for this vdev!
+					ze = kmem_zalloc(sizeof (zvol_extent_t), KM_SLEEP);
+					ze->ze_dva = bp.blk_dva[0]; /* structure assignment */
+					ze->ze_nblks = 1;
+					ze->ze_offset = ze_offset;
+				}
+
+				ze_offset += bs;
+			}
+
+			// nuke list
+			kmem_free(all, list_size * sizeof (blkptr_t));
+
+			// switching DVA_GET_VDEV means a new extent
+			if (ze) {
+				avl_add(&zv->zv_extents, ze);
+				ze = NULL;
+			}
+		}
+
+		VERIFY3U(ze_offset, ==, zv->zv_volsize);
+
+		// nuke the temporary tree
+		void *cookie = NULL;
+
+		while ((bucket = avl_destroy_nodes(&ma.ma_dva_vdevs, &cookie)) != NULL) {
+			kmem_free(bucket, sizeof (dva_vdevs_t));
+		}
 	}
 
 	return (0);
