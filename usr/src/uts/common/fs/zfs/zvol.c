@@ -335,7 +335,7 @@ zvol_map_block(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
 			    (DVA_GET_OFFSET(&found->ze_dva) + found->ze_nblks * bs)
 			    == DVA_GET_OFFSET(&next->ze_dva);
 
-			if (contiguous_offset && save_vdev &&
+			if (contiguous_offset && same_vdev &&
 			    contiguous_dva_offset) {
 				found->ze_nblks += next->ze_nblks;
 				avl_remove(&ma->ma_zv->zv_extents, next);
